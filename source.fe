@@ -1,0 +1,9 @@
+class Foo {
+	x: f32 = 3.3;
+}
+
+fn foo(x: Foo) -> i32 {
+	x * 2
+}
+
+let x = foo;
