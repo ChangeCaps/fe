@@ -70,6 +70,7 @@ pub fn format_bin_op<W: Write>(op: &BinOp, f: &mut Formatter<'_, W>) -> FmtResul
         BinOp::Sub => f.write("-"),
         BinOp::Mul => f.write("*"),
         BinOp::Div => f.write("/"),
+        BinOp::Mod => f.write("%"),
         BinOp::EqEq => f.write("=="),
         BinOp::NotEq => f.write("!="),
         BinOp::Gt => f.write(">"),
@@ -161,11 +162,6 @@ pub fn format_expr<W: Write>(expr: &Expr, f: &mut Formatter<'_, W>) -> FmtResult
 #[inline]
 pub fn format_stmt<W: Write>(stmt: &Stmt, f: &mut Formatter<'_, W>) -> FmtResult {
     match stmt {
-        Stmt::Let(ident, expr) => {
-            f.write(format!("let {} = ", ident.as_ref()))?;
-            format_expr(expr, f)?;
-            f.write(";")
-        }
         Stmt::Expr(expr) => {
             format_expr(expr, f)?;
             f.write(";")

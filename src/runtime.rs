@@ -1,6 +1,10 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-use crate::variant::{Ref, Variant};
+use crate::{
+    compilation::Id,
+    program::Program,
+    variant::{Ref, Variant},
+};
 
 #[derive(Clone, Debug)]
 pub enum RuntimeError {
@@ -8,15 +12,63 @@ pub enum RuntimeError {
     InvalidAccess,
     InvalidDeref,
     InvalidOp,
+    EmbeddedFunc,
     ExpectedBool,
     ExpectedFunc,
+    ExpectedClass,
+    ExpectedI32,
 }
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Func {
     Func(Expr),
+    Embedded(Arc<Box<dyn Fn(Vec<Variant>) -> Option<Variant>>>),
+}
+
+impl std::fmt::Debug for Func {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Func(expr) => expr.fmt(f),
+            Self::Embedded(_) => write!(f, "Embedded"),
+        }
+    }
+}
+
+impl Func {
+    #[inline]
+    pub fn eval(&self, expr_args: &[Expr], runtime: &mut Runtime) -> RuntimeResult<Variant> {
+        match self {
+            Func::Func(func) => {
+                let mut stack = Stack::default();
+
+                for arg in expr_args {
+                    stack.push(arg.eval(runtime)?);
+                }
+
+                let mut runtime = Runtime {
+                    stack,
+                    program: runtime.program,
+                };
+
+                func.eval(&mut runtime)
+            }
+            Func::Embedded(func) => {
+                let mut args = Vec::with_capacity(expr_args.len());
+
+                for arg in expr_args {
+                    args.push(arg.eval(runtime)?);
+                }
+
+                if let Some(var) = func(args) {
+                    Ok(var)
+                } else {
+                    Err(RuntimeError::EmbeddedFunc)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,29 +125,14 @@ impl<'a> Runtime<'a> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Program {
-    pub instructions: Vec<Instruction>,
-    pub functions: Vec<Func>,
-}
-
-impl Program {
-    #[inline]
-    pub fn eval(&self, runtime: &mut Runtime) -> RuntimeResult<()> {
-        for instruction in &self.instructions {
-            instruction.eval(runtime)?;
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum Instruction {
     Push(Expr),
     PushVariant(Variant),
     Pop(usize),
     Expr(Expr),
+    While(Expr, Expr),
+    If(Expr, Expr, Option<Expr>),
 }
 
 impl Instruction {
@@ -124,6 +161,38 @@ impl Instruction {
 
                 Ok(())
             }
+            Self::While(check, expr) => {
+                loop {
+                    let check = check.eval(runtime)?;
+
+                    if let Variant::Bool(check) = check {
+                        if !check {
+                            break;
+                        }
+                    } else {
+                        return Err(RuntimeError::ExpectedBool);
+                    }
+
+                    expr.eval(runtime)?;
+                }
+
+                Ok(())
+            }
+            Self::If(check, expr, else_expr) => {
+                let check = check.eval(runtime)?;
+
+                if let Variant::Bool(check) = check {
+                    if check {
+                        expr.eval(runtime)?;
+                    } else if let Some(expr) = else_expr {
+                        expr.eval(runtime)?;
+                    }
+
+                    Ok(())
+                } else {
+                    Err(RuntimeError::ExpectedBool)
+                }
+            }
         }
     }
 }
@@ -131,6 +200,8 @@ impl Instruction {
 #[derive(Clone, Debug)]
 pub enum Access {
     Variable(usize),
+    Field(Box<Access>, usize),
+    Deref(Box<Access>),
 }
 
 impl Access {
@@ -138,10 +209,28 @@ impl Access {
     pub fn access<O>(
         &self,
         runtime: &mut Runtime,
-        f: impl FnOnce(&mut Ref) -> RuntimeResult<O>,
+        f: &mut dyn FnMut(&mut Ref) -> RuntimeResult<O>,
     ) -> RuntimeResult<O> {
         match self {
             Access::Variable(idx) => f(&mut runtime.stack.entries[*idx]),
+            Access::Field(access, idx) => access.access(runtime, &mut |ref_var| {
+                ref_var.map_mut(|var| {
+                    if let Variant::Class(fields) = var {
+                        f(&mut fields[*idx])
+                    } else {
+                        Err(RuntimeError::ExpectedClass)
+                    }
+                })
+            }),
+            Access::Deref(access) => access.access(runtime, &mut |ref_var| {
+                ref_var.map_mut(|var| {
+                    if let Variant::Ref(var) = var {
+                        f(var)
+                    } else {
+                        Err(RuntimeError::InvalidDeref)
+                    }
+                })
+            }),
         }
     }
 }
@@ -154,15 +243,19 @@ pub enum Expr {
     Ref(Access),
     RefOwned(Box<Expr>),
     Deref(Box<Expr>),
+    Field(Box<Expr>, usize),
     Block(Vec<Instruction>, Option<Box<Expr>>, usize),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
-    Call(usize, Vec<Expr>),
+    Call(Id, Vec<Expr>),
     CallExpr(Box<Expr>, Vec<Expr>),
+    I32ToF32(Box<Expr>),
+    ClassInit(Vec<Expr>),
     // binary operators
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
     Div(Box<Expr>, Box<Expr>),
+    Mod(Box<Expr>, Box<Expr>),
     Gt(Box<Expr>, Box<Expr>),
     Lt(Box<Expr>, Box<Expr>),
     GtEq(Box<Expr>, Box<Expr>),
@@ -232,12 +325,12 @@ impl Expr {
             Expr::Assign(lhs, rhs) => {
                 let rhs = rhs.eval(runtime)?;
 
-                lhs.access(runtime, |ref_var| {
-                    ref_var.map_mut(|var| *var = rhs);
+                lhs.access(runtime, &mut |ref_var| {
+                    ref_var.map_mut(|var| *var = rhs.clone());
                     Ok(Variant::Unit)
                 })
             }
-            Expr::Ref(access) => access.access(runtime, |ref_var| {
+            Expr::Ref(access) => access.access(runtime, &mut |ref_var| {
                 match ref_var {
                     Ref::Owned(var) => *ref_var = Ref::Ref(Rc::new(RefCell::new(var.clone()))),
                     _ => {}
@@ -253,6 +346,13 @@ impl Expr {
                     Ok(var.cloned())
                 } else {
                     Err(RuntimeError::InvalidDeref)
+                }
+            }
+            Expr::Field(expr, idx) => {
+                if let Variant::Class(fields) = expr.eval(runtime)? {
+                    Ok(fields[*idx].cloned())
+                } else {
+                    Err(RuntimeError::ExpectedClass)
                 }
             }
             Expr::Block(instructions, expr, pop) => {
@@ -285,54 +385,75 @@ impl Expr {
                     Err(RuntimeError::ExpectedBool)
                 }
             }
-            Expr::Call(idx, expr_args) => {
-                let mut stack = Stack::default();
-
-                for arg in expr_args {
-                    stack.push(arg.eval(runtime)?);
-                }
-
-                let mut runtime = Runtime {
-                    stack,
-                    program: runtime.program,
-                };
-
-                let func = &runtime.program.functions[*idx];
-
-                let Func::Func(func) = func;
-
-                func.eval(&mut runtime)
-            }
+            Expr::Call(id, expr_args) => runtime
+                .program
+                .data
+                .funcs
+                .get(id)
+                .unwrap()
+                .eval(expr_args, runtime),
             Expr::CallExpr(expr, expr_args) => {
                 let var = expr.eval(runtime)?;
 
-                let idx = if let Variant::Func(idx) = var {
-                    idx
+                let id = if let Variant::Func(id) = var {
+                    id
                 } else {
                     return Err(RuntimeError::ExpectedFunc);
                 };
 
-                let mut stack = Stack::default();
+                runtime
+                    .program
+                    .data
+                    .funcs
+                    .get(&id)
+                    .unwrap()
+                    .eval(expr_args, runtime)
+            }
+            Expr::I32ToF32(expr) => {
+                let var = expr.eval(runtime)?;
 
-                for arg in expr_args {
-                    stack.push(arg.eval(runtime)?);
+                if let Variant::I32(int) = var {
+                    Ok(Variant::F32(int as f32))
+                } else {
+                    Err(RuntimeError::ExpectedI32)
+                }
+            }
+            Expr::ClassInit(fields) => {
+                let mut class_fields = Vec::with_capacity(fields.len());
+
+                for field in fields {
+                    class_fields.push(Ref::Owned(field.eval(runtime)?));
                 }
 
-                let mut runtime = Runtime {
-                    stack,
-                    program: runtime.program,
-                };
-
-                let func = &runtime.program.functions[idx];
-
-                let Func::Func(func) = func;
-
-                func.eval(&mut runtime)
+                Ok(Variant::Class(class_fields))
             }
-            Expr::Add(lhs, rhs) => math_op!(lhs + rhs),
+            Expr::Add(lhs, rhs) => {
+                let lhs = lhs.eval(runtime)?;
+                let rhs = rhs.eval(runtime)?;
+
+                match lhs {
+                    Variant::I32(lhs) => {
+                        if let Variant::I32(rhs) = rhs {
+                            Ok(Variant::I32(lhs + rhs))
+                        } else {
+                            Err(RuntimeError::InvalidOp)
+                        }
+                    }
+                    Variant::F32(lhs) => {
+                        if let Variant::F32(rhs) = rhs {
+                            Ok(Variant::F32(lhs + rhs))
+                        } else {
+                            Err(RuntimeError::InvalidOp)
+                        }
+                    }
+                    Variant::String(lhs) => Ok(Variant::String(lhs + &rhs.to_string())),
+                    _ => Err(RuntimeError::InvalidOp),
+                }
+            }
             Expr::Sub(lhs, rhs) => math_op!(lhs - rhs),
             Expr::Mul(lhs, rhs) => math_op!(lhs * rhs),
             Expr::Div(lhs, rhs) => math_op!(lhs / rhs),
+            Expr::Mod(lhs, rhs) => math_op!(lhs % rhs),
             Expr::Gt(lhs, rhs) => cmp_op!(lhs > rhs),
             Expr::Lt(lhs, rhs) => cmp_op!(lhs < rhs),
             Expr::GtEq(lhs, rhs) => cmp_op!(lhs >= rhs),

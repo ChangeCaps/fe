@@ -46,7 +46,9 @@ pub fn error_message(source: &str, span: Span, message: &str) -> String {
             .map(|c| if c.is_whitespace() { c } else { ' ' })
             .collect::<String>();
 
-        msg += &vec!['^'; span.hi - span.lo].into_iter().collect::<String>();
+        msg += &vec!['^'; (span.hi - span.lo).max(1)]
+            .into_iter()
+            .collect::<String>();
 
         msg += "\n";
 

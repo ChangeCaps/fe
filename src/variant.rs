@@ -1,4 +1,9 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{any::TypeId, cell::RefCell, rc::Rc};
+
+use crate::{
+    compilation::Id,
+    ty::{CustomType, Type},
+};
 
 #[derive(Clone, Debug)]
 pub enum Ref {
@@ -38,6 +43,15 @@ impl Ref {
     }
 }
 
+impl std::fmt::Display for Ref {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(variant) => write!(f, "{}", variant),
+            Self::Ref(ref_variant) => write!(f, "{}", ref_variant.borrow()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Variant {
     I32(i32),
@@ -45,7 +59,10 @@ pub enum Variant {
     Bool(bool),
     Ref(Box<Ref>),
     Type(VariantType),
-    Func(usize),
+    Class(Vec<Ref>),
+    Func(Id),
+    String(String),
+    Custom(CustomType),
     Unit,
 }
 
@@ -57,13 +74,28 @@ impl std::fmt::Display for Variant {
             Self::Bool(v) => write!(f, "{}", v),
             Self::Ref(v) => write!(f, "&{:?}", v),
             Self::Type(v) => write!(f, "<{}>", v),
-            Self::Func(v) => write!(f, "[func:{}]", v),
+            Self::Class(v) => {
+                write!(f, "[class:{{")?;
+
+                for (i, var) in v.iter().enumerate() {
+                    if i < v.len() - 1 {
+                        var.map(|var| write!(f, "{}, ", var))?;
+                    } else {
+                        var.map(|var| write!(f, "{}", var))?;
+                    }
+                }
+
+                write!(f, "}}]")
+            }
+            Self::String(v) => write!(f, "{}", v),
+            Self::Func(v) => write!(f, "[func:{}]", v.0),
+            Self::Custom(ty) => Type::fmt(ty.as_ref(), f),
             Self::Unit => write!(f, "()"),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum VariantType {
     I32,
     F32,
@@ -71,8 +103,11 @@ pub enum VariantType {
     Ref(Box<VariantType>),
     Type,
     Func(Vec<VariantType>, Box<VariantType>),
-    Class(usize),
+    Class(Id),
+    String,
     Unit,
+    Custom(TypeId),
+    Any,
 }
 
 impl std::fmt::Display for VariantType {
@@ -96,8 +131,11 @@ impl std::fmt::Display for VariantType {
 
                 write!(f, ") -> {}", return_type)
             }
-            Self::Class(idx) => write!(f, "[class:{}]", idx),
+            Self::Class(id) => write!(f, "[class:{{{}}}]", id.0),
+            Self::String => write!(f, "str"),
             Self::Unit => write!(f, "()"),
+            Self::Custom(_) => write!(f, "custom"),
+            Self::Any => write!(f, "any"),
         }
     }
 }

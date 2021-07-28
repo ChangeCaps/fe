@@ -1,9 +1,13 @@
-class Foo {
-	x: f32 = 3.3;
+let start: std::time::Instant = std::time::now();
+
+let i = 1000000;
+
+while i > 0 {
+	i = i - 1;
 }
 
-fn foo(x: Foo) -> i32 {
-	x * 2
-}
+let d: std::time::Duration = std::time::now().duration_since(start);
 
-let x = foo;
+println("a million iterations took: " + d);
+println(3.min(4));
+println(3.max(4));

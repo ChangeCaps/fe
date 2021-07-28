@@ -1,9 +1,9 @@
 use crate::{
     ast::{
-        BinOp, Block, Class, ClassStmt, Expr, ExprBlock, Func, FuncArg, Ident, Literal, Path,
-        Program, Stmt, TypeLiteral, UnaryOp,
+        BinOp, Block, Class, ClassStmt, Expr, ExprBlock, Func, FuncArg, Ident, Literal, Method,
+        NamedModule, Path, Program, SelfArg, Stmt, TypeLiteral, UnaryOp,
     },
-    spanned::{Span, Spanned},
+    spanned::{self, Span, Spanned},
 };
 
 pub type ParseResult<T> = Result<T, Spanned<ParseError>>;
@@ -244,12 +244,15 @@ fn ident(parser: &mut Parser<'_>) -> ParseResult<Ident> {
 fn number(parser: &mut Parser<'_>) -> ParseResult<Literal> {
     let first = parser.take_while1(|c| c.is_numeric())?;
 
-    if parser.token(".").is_ok() {
+    if let Ok(lit) = parser.peek(|parser| {
+        parser.token(".")?;
         let last = parser.take_while1(|c| c.is_numeric())?;
 
         Ok(Literal::F32(
             (first.to_owned() + "." + last).parse().unwrap(),
         ))
+    }) { 
+        Ok(lit)
     } else {
         Ok(Literal::I32(first.parse().unwrap()))
     }
@@ -268,7 +271,9 @@ fn variant_type(parser: &mut Parser<'_>) -> ParseResult<TypeLiteral> {
         parser.token("bool") => |_| Ok(TypeLiteral::Bool),
         parser.token("type") => |_| Ok(TypeLiteral::Type),
         parser.token("()") => |_| Ok(TypeLiteral::Unit),
-        ident(parser) => |ident| Ok(TypeLiteral::Class(ident))
+        parser.token("any") => |_| Ok(TypeLiteral::Any),
+        parser.token("str") => |_| Ok(TypeLiteral::String),
+        path(parser) => |ident| Ok(TypeLiteral::Class(ident))
     )
 }
 
@@ -276,11 +281,11 @@ fn variant_type(parser: &mut Parser<'_>) -> ParseResult<TypeLiteral> {
 fn path(parser: &mut Parser<'_>) -> ParseResult<Path> {
     let mut segments = Vec::new();
 
-    segments.push(ident(parser)?);
+    segments.push(spanned(parser, ident)?);
 
     loop {
         if parser.token("::").is_ok() {
-            segments.push(ident(parser)?);
+            segments.push(spanned(parser, ident)?);
         } else {
             break;
         }
@@ -337,6 +342,34 @@ fn block_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
 }
 
 #[inline]
+fn class_init_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
+    let ty = spanned(parser, variant_type)?;
+    parser.whitespace0()?;
+    parser.token("{")?;
+
+    let mut fields = Vec::new();
+
+    loop {
+        parser.whitespace0()?;
+        if parser.token("}").is_ok() {
+            break;
+        }
+
+        let ident = spanned(parser, ident)?;
+        parser.whitespace0()?;
+        parser.token(":")?;
+        parser.whitespace0()?;
+        let expr = spanned(parser, expr)?;
+        parser.whitespace0()?;
+        parser.token(",")?;
+
+        fields.push((ident, expr));
+    }
+
+    Ok(Expr::ClassInit(ty, fields))
+}
+
+#[inline]
 fn term_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
     alt!(
         parser.token("type") => |_| {
@@ -360,9 +393,20 @@ fn term_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
         parser.token("true") => |_| Ok(Expr::Literal(Literal::Bool(true))),
         parser.token("false") => |_| Ok(Expr::Literal(Literal::Bool(false))),
         parser.token("()") => |_| Ok(Expr::Literal(Literal::Unit)),
+        parser.peek(|parser| class_init_expr(parser)),
         parser.peek(|parser| spanned(parser, path)).map(|path| Expr::Variable(path)),
         number(parser) => |variant| Ok(Expr::Literal(variant)),
         parser.token_peek("{") => |_| block_expr(parser),
+        parser.token("\"") => |_| {
+            let string = parser.take_while0(|c| c != '"')?;
+            parser.token("\"")?;
+
+            let mut string = string.replace(r#"\n"#, "\n");
+            string = string.replace(r#"\t"#, "\t");
+            string = string.replace(r#"\r"#, "\r");
+
+            Ok(Expr::Literal(Literal::String(string)))
+        },
         parser.token("(") => |_| {
             parser.whitespace0()?;
             let expr = spanned(parser, expr)?;
@@ -399,8 +443,6 @@ fn call_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
 
             loop {
                 if parser.token(")").is_ok() {
-                    opt(parser, |parser| parser.token(","));
-
                     break;
                 }
 
@@ -421,6 +463,47 @@ fn call_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
 }
 
 #[inline]
+fn access_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
+    let mut lhs = spanned(parser, call_expr)?;
+
+    loop {
+        if parser.token(".").is_ok() {
+            let ident = spanned(parser, ident)?;
+
+            if parser.token("(").is_ok() {
+                let mut args = Vec::new();
+
+                loop {
+                    parser.whitespace0()?;
+                    if parser.token(")").is_ok() {
+                        break;
+                    }
+
+                    if args.len() > 0 {
+                        parser.token(",")?;
+                    }
+
+                    parser.whitespace0()?;
+                    let arg = spanned(parser, expr)?;
+
+                    args.push(arg);
+                }
+
+                let span = lhs.span.clone() + ident.span.clone();
+                lhs = Spanned::new(Expr::MethodCall(Box::new(lhs), ident, args), span);
+            } else {
+                let span = lhs.span.clone() + ident.span.clone();
+                lhs = Spanned::new(Expr::Field(Box::new(lhs), ident), span);
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(lhs.inner)
+}
+
+#[inline]
 fn unary_op(parser: &mut Parser<'_>) -> ParseResult<UnaryOp> {
     alt!(
         parser.token("&") => |_| Ok(UnaryOp::Ref),
@@ -437,8 +520,56 @@ fn unary_op_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
 
         Ok(Expr::UnaryOp(op, Box::new(expr)))
     } else {
-        call_expr(parser)
+        access_expr(parser)
     }
+}
+
+#[inline]
+fn comment_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
+    let expr = spanned(parser, unary_op_expr)?;
+
+    parser.whitespace0()?;
+
+    if parser.token("//").is_ok() {
+        let comment = parser.take_while0(|c| c != '\n')?;
+
+        Ok(Expr::Comment(Box::new(expr), String::from(comment)))
+    } else {
+        Ok(expr.inner)
+    }
+}
+
+#[inline]
+fn mul_op(parser: &mut Parser<'_>) -> ParseResult<BinOp> {
+    alt!(
+        parser.token("*") => |_| Ok(BinOp::Mul),
+        parser.token("/") => |_| Ok(BinOp::Div),
+        parser.token("%") => |_| Ok(BinOp::Mod),
+    )
+}
+
+#[inline]
+fn mul_expr(parser: &mut Parser<'_>, lhs: Spanned<Expr>) -> ParseResult<Expr> {
+    parser.whitespace0()?;
+
+    alt!(
+        spanned(parser, mul_op) => |op| {
+            parser.whitespace0()?;
+
+            let rhs = spanned(parser, comment_expr)?;
+
+            let span = lhs.span.clone() + rhs.span.clone();
+
+            let lhs = Spanned::new(Expr::BinOp(
+                Box::new(lhs),
+                op,
+                Box::new(rhs),
+            ), span);
+
+            mul_expr(parser, lhs)
+        },
+        Ok(lhs.inner),
+    )
 }
 
 #[inline]
@@ -450,52 +581,28 @@ fn add_op(parser: &mut Parser<'_>) -> ParseResult<BinOp> {
 }
 
 #[inline]
-fn add_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
-    let lhs = spanned(parser, unary_op_expr)?;
+fn add_expr(parser: &mut Parser<'_>, lhs: Spanned<Expr>) -> ParseResult<Expr> {
+    let lhs = spanned(parser, |parser| mul_expr(parser, lhs))?;
     parser.whitespace0()?;
 
     alt!(
         spanned(parser, add_op) => |op| {
             parser.whitespace0()?;
 
-            let rhs = Box::new(spanned(parser, add_expr)?);
+            let rhs = spanned(parser, comment_expr)?;
+            let rhs = spanned(parser, |parser| mul_expr(parser, rhs))?;
 
-            Ok(Expr::BinOp(
+            let span = lhs.span.clone() + rhs.span.clone();
+
+            let lhs = Spanned::new(Expr::BinOp(
                 Box::new(lhs),
                 op,
-                rhs
-            ))
+                Box::new(rhs),
+            ), span);
+
+            add_expr(parser, lhs)
         },
         Ok(lhs.inner.clone()),
-    )
-}
-
-#[inline]
-fn mul_op(parser: &mut Parser<'_>) -> ParseResult<BinOp> {
-    alt!(
-        parser.token("*") => |_| Ok(BinOp::Mul),
-        parser.token("/") => |_| Ok(BinOp::Div),
-    )
-}
-
-#[inline]
-fn mul_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
-    let lhs = spanned(parser, add_expr)?;
-    parser.whitespace0()?;
-
-    alt!(
-        spanned(parser, mul_op) => |op| {
-            parser.whitespace0()?;
-
-            let rhs = Box::new(spanned(parser, mul_expr)?);
-
-            Ok(Expr::BinOp(
-                Box::new(lhs),
-                op,
-                rhs
-            ))
-        },
-        Ok(lhs.inner),
     )
 }
 
@@ -512,21 +619,26 @@ fn cmp_op(parser: &mut Parser<'_>) -> ParseResult<BinOp> {
 }
 
 #[inline]
-fn cmp_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
-    let lhs = spanned(parser, mul_expr)?;
+fn cmp_expr(parser: &mut Parser<'_>, lhs: Spanned<Expr>) -> ParseResult<Expr> {
+    let lhs = spanned(parser, |parser| add_expr(parser, lhs))?;
     parser.whitespace0()?;
 
     alt!(
         spanned(parser, cmp_op) => |op| {
             parser.whitespace0()?;
 
-            let rhs = Box::new(spanned(parser, cmp_expr)?);
+            let rhs = spanned(parser, comment_expr)?;
+            let rhs = spanned(parser, |parser| add_expr(parser, rhs))?;
 
-            Ok(Expr::BinOp(
+            let span = lhs.span.clone() + rhs.span.clone();
+
+            let lhs = Spanned::new(Expr::BinOp(
                 Box::new(lhs),
                 op,
-                rhs
-            ))
+                Box::new(rhs),
+            ), span);
+
+            cmp_expr(parser, lhs)
         },
         Ok(lhs.inner),
     )
@@ -541,21 +653,26 @@ fn bool_op(parser: &mut Parser<'_>) -> ParseResult<BinOp> {
 }
 
 #[inline]
-fn bool_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
-    let lhs = spanned(parser, cmp_expr)?;
+fn bool_expr(parser: &mut Parser<'_>, lhs: Spanned<Expr>) -> ParseResult<Expr> {
+    let lhs = spanned(parser, |parser| cmp_expr(parser, lhs))?;
     parser.whitespace0()?;
 
     alt!(
         spanned(parser, bool_op) => |op| {
             parser.whitespace0()?;
 
-            let rhs = Box::new(spanned(parser, bool_expr)?);
+            let rhs = spanned(parser, comment_expr)?;
+            let rhs = spanned(parser, |parser| cmp_expr(parser, rhs))?;
 
-            Ok(Expr::BinOp(
+            let span = lhs.span.clone() + rhs.span.clone();
+
+            let lhs = Spanned::new(Expr::BinOp(
                 Box::new(lhs),
                 op,
-                rhs
-            ))
+                Box::new(rhs),
+            ), span);
+
+            bool_expr(parser, lhs)
         },
         Ok(lhs.inner),
     )
@@ -563,7 +680,8 @@ fn bool_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
 
 #[inline]
 fn assign_expr(parser: &mut Parser<'_>) -> ParseResult<Expr> {
-    let lhs = spanned(parser, bool_expr)?;
+    let lhs = spanned(parser, comment_expr)?;
+    let lhs = spanned(parser, |parser| bool_expr(parser, lhs))?;
 
     alt!(
         parser.token("=") => |_| {
@@ -588,13 +706,35 @@ fn let_stmt(parser: &mut Parser<'_>) -> ParseResult<Stmt> {
     parser.whitespace1()?;
     let ident = spanned(parser, ident)?;
     parser.whitespace0()?;
+    let ty = opt(parser, |parser| spanned(parser, typed));
+    parser.whitespace0()?;
     parser.token("=")?;
     parser.whitespace0()?;
     let expr = spanned(parser, expr)?;
     parser.whitespace0()?;
     parser.token(";")?;
 
-    Ok(Stmt::Let(ident, expr))
+    Ok(Stmt::Let(ident, ty, expr))
+}
+
+#[inline]
+fn if_stmt(parser: &mut Parser<'_>) -> ParseResult<Stmt> {
+    parser.token("if")?;
+    parser.whitespace1()?;
+    let check = spanned(parser, expr)?;
+    parser.whitespace0()?;
+    let expr = spanned(parser, block_expr)?;
+    parser.whitespace0()?;
+
+    let else_expr = if parser.token_peek("else").is_ok() {
+        parser.whitespace0()?;
+
+        Some(spanned(parser, block_expr)?)
+    } else {
+        None
+    };
+
+    Ok(Stmt::If(check, expr, else_expr))
 }
 
 #[inline]
@@ -651,32 +791,97 @@ fn func(parser: &mut Parser<'_>) -> ParseResult<Func> {
 }
 
 #[inline]
+fn self_arg(parser: &mut Parser<'_>) -> ParseResult<SelfArg> {
+    alt!(
+        parser.token("self") => |_| Ok(SelfArg::Owned),
+        parser.token("&self") => |_| Ok(SelfArg::Ref),
+    )
+}
+
+#[inline]
+fn method(parser: &mut Parser<'_>) -> ParseResult<Method> {
+    parser.token("fn")?;
+    parser.whitespace1()?;
+    let ident = spanned(parser, ident)?;
+    parser.whitespace0()?;
+
+    parser.token("(")?;
+
+    let self_arg = if let Ok(self_arg) = self_arg(parser) {
+        parser.whitespace0()?;
+
+        self_arg
+    } else {
+        SelfArg::None
+    };
+
+    let mut args = Vec::new();
+
+    loop {
+        if parser.token(")").is_ok() {
+            if args.len() > 0 {
+                opt(parser, |parser| parser.token(","));
+            }
+
+            break;
+        }
+
+        if args.len() > 0 || self_arg != SelfArg::None {
+            parser.token(",")?;
+            parser.whitespace0()?;
+        }
+
+        let ident = spanned(parser, self::ident)?;
+        parser.whitespace0()?;
+        parser.token(":")?;
+        parser.whitespace0()?;
+        let ty = spanned(parser, variant_type)?;
+
+        args.push(FuncArg { ident, ty });
+    }
+
+    let return_type = opt(parser, |parser| {
+        parser.whitespace0()?;
+        parser.token("->")?;
+        parser.whitespace0()?;
+        spanned(parser, variant_type)
+    });
+
+    parser.whitespace0()?;
+
+    let expr = spanned(parser, block_expr)?;
+
+    Ok(Method {
+        ident,
+        self_arg,
+        args,
+        return_type,
+        expr,
+    })
+}
+
+#[inline]
 fn class_stmt(parser: &mut Parser<'_>) -> ParseResult<ClassStmt> {
     alt!(
-        parser.token_peek("fn") => |_| Ok(ClassStmt::Method(func(parser)?)),
+        parser.token_peek("fn") => |_| Ok(ClassStmt::Method(method(parser)?)),
+        parser.token("//") => |_| {
+            let comment = parser.take_while0(|c| c != '\n')?;
+
+            Ok(ClassStmt::Comment(String::from(comment)))
+        },
         spanned(parser, ident) => |ident| {
             parser.whitespace0()?;
-
-            let ty = opt(parser, |parser| spanned(parser, typed));
-
+            let ty = spanned(parser, typed)?;
             parser.whitespace0()?;
+            parser.token(",")?;
 
-            let expr = opt(parser, |parser| {
-                parser.token("=")?;
-                parser.whitespace0()?;
-                spanned(parser, expr)
-            });
-
-            parser.whitespace0()?;
-            parser.token(";")?;
-
-            Ok(ClassStmt::Field(ident, ty, expr))
+            Ok(ClassStmt::Field(ident, ty))
         }
     )
 }
 
 #[inline]
-fn class(parser: &mut Parser<'_>) -> ParseResult<Stmt> {
+fn class(parser: &mut Parser<'_>) -> ParseResult<Class> {
     parser.token("class")?;
     parser.whitespace1()?;
     let ident = spanned(parser, ident)?;
@@ -699,7 +904,32 @@ fn class(parser: &mut Parser<'_>) -> ParseResult<Stmt> {
         stmts.push(stmt);
     }
 
-    Ok(Stmt::Class(Class { ident, stmts }))
+    Ok(Class { ident, stmts })
+}
+
+#[inline]
+fn named_module(parser: &mut Parser<'_>) -> ParseResult<NamedModule> {
+    parser.token("mod")?;
+    parser.whitespace1()?;
+    let ident = ident(parser)?;
+    parser.whitespace0()?;
+    parser.token("{")?;
+
+    let mut stmts = Vec::new();
+
+    loop {
+        parser.whitespace0()?;
+
+        if parser.token("}").is_ok() {
+            break;
+        }
+
+        let stmt = spanned(parser, stmt)?;
+
+        stmts.push(stmt);
+    }
+
+    Ok(NamedModule { ident, stmts })
 }
 
 #[inline]
@@ -707,13 +937,28 @@ pub fn stmt(parser: &mut Parser<'_>) -> ParseResult<Stmt> {
     alt!(
         parser.token_peek("let") => |_| let_stmt(parser),
         parser.token_peek("fn") => |_| Ok(Stmt::Func(func(parser)?)),
-        parser.token_peek("class") => |_| class(parser),
+        parser.token_peek("class") => |_| Ok(Stmt::Class(class(parser)?)),
+        parser.token_peek("mod") => |_| Ok(Stmt::Module(named_module(parser)?)),
+        parser.token_peek("if") => |_| if_stmt(parser),
+        parser.token("while") => |_| {
+            parser.whitespace1()?;
+            let check = spanned(parser, expr)?;
+            parser.whitespace0()?;
+            let expr = spanned(parser, block_expr)?;
+
+            Ok(Stmt::While(check, expr))
+        },
+        parser.token("//") => |_| {
+            let comment = parser.take_while0(|c| c != '\n')?;
+
+            Ok(Stmt::Comment(String::from(comment)))
+        },
         spanned(parser, expr) => |expr| {
             parser.token(";")?;
 
             Ok(Stmt::Expr(expr))
         },
-        Err(Spanned::new(ParseError::Expected(&["let", "class", "{", "expression"]), parser.position()))
+        Err(Spanned::new(ParseError::Expected(&["let", "mod", "fn", "class", "{", "expression"]), parser.position()))
     )
 }
 
